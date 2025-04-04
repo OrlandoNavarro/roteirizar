@@ -1,6 +1,8 @@
 import requests
 import pandas as pd
 import streamlit as st
+import sqlite3
+import datetime
 from sklearn.cluster import KMeans
 import networkx as nx
 from itertools import permutations
@@ -8,6 +10,14 @@ from geopy.distance import geodesic
 import folium
 from streamlit_folium import folium_static
 import random
+from db import initialize_db, save_upload, get_saved_coordinates, save_coordinates
+
+# Inicializa o banco de dados (caso ainda não exista)
+initialize_db()
+
+# Credenciais padrões
+DB_USERNAME = "Orlando"
+DB_PASSWORD = "Picole2024@"
 
 # Endereço de partida fixo
 endereco_partida = "Avenida Antonio Ortega, 3604 - Pinhal, Cabreúva - SP, São Paulo, Brasil"
@@ -32,22 +42,20 @@ def obter_coordenadas_opencage(endereco):
         return None
 
 # Função para obter coordenadas com fallback para coordenadas manuais
-def obter_coordenadas_com_fallback(endereco, coordenadas_salvas):
-    if endereco in coordenadas_salvas:
-        return coordenadas_salvas[endereco]
+def obter_coordenadas_com_fallback(endereco):
+    # Primeiro, tenta recuperar as coordenadas do banco de dados
+    coords = get_saved_coordinates(endereco)
+    if coords is not None:
+        return coords  # (latitude, longitude)
     
+    # Caso não exista no banco, consulta a API
     coords = obter_coordenadas_opencage(endereco)
-    if coords is None:
-        # Coordenadas manuais para endereços específicos
-        coordenadas_manuais = {
-            "Rua Araújo Leite, 146, Centro, Piedade, São Paulo, Brasil": (-23.71241093449893, -47.41796911054548)
-        }
-        coords = coordenadas_manuais.get(endereco, (None, None))
-    
-    if coords:
-        coordenadas_salvas[endereco] = coords
-    
-    return coords
+    if coords is not None:
+        # Salva as coordenadas no banco para futuras consultas
+        save_coordinates(endereco, coords[0], coords[1])
+        return coords
+    else:
+        return (None, None)
 
 # Função para calcular distância entre dois endereços usando a fórmula de Haversine
 def calcular_distancia(coords_1, coords_2):
@@ -129,6 +137,7 @@ def resolver_vrp(pedidos_df, caminhoes_df):
 def otimizar_aproveitamento_frota(pedidos_df, caminhoes_df, percentual_frota, max_pedidos, n_clusters):
     pedidos_df['Nº Carga'] = 0
     pedidos_df['Placa'] = ""
+    pedidos_df['Capac. Kg'] = None
     carga_numero = 1
     
     # Ajustar a capacidade da frota
@@ -154,6 +163,7 @@ def otimizar_aproveitamento_frota(pedidos_df, caminhoes_df, percentual_frota, ma
             if not pedidos_alocados.empty:
                 pedidos_df.loc[pedidos_alocados.index, 'Nº Carga'] = carga_numero
                 pedidos_df.loc[pedidos_alocados.index, 'Placa'] = caminhao['Placa']
+                pedidos_df.loc[pedidos_alocados.index, 'Capac. Kg'] = caminhao['Capac. Kg']
                 
                 capacidade_peso -= pedidos_alocados['Peso dos Itens'].sum()
                 capacidade_caixas -= pedidos_alocados['Qtde. dos Itens'].sum()
@@ -164,6 +174,17 @@ def otimizar_aproveitamento_frota(pedidos_df, caminhoes_df, percentual_frota, ma
     if pedidos_df['Placa'].isnull().any() or pedidos_df['Nº Carga'].isnull().any():
         st.error("Não foi possível atribuir placas ou números de carga a alguns pedidos. Verifique os dados e tente novamente.")
     
+    # Ordena os pedidos mantendo o Nº Pedido original
+    pedidos_df = pedidos_df.sort_values(by=['Nº Carga', 'Nº Pedido'])
+
+    # Verifica se 'Nº Carga' possui valores nulos; se sim, alerta o usuário
+    if pedidos_df['Nº Carga'].isnull().any():
+        st.error("Existem pedidos sem número de carga definido. Verifique os dados.")
+    else:
+        # Cria a coluna "Ordem de Entrega" para cada grupo de "Nº Carga"
+        pedidos_df['Ordem de Entrega'] = pedidos_df.groupby('Nº Carga').cumcount() + 1
+        pedidos_df['Ordem de Entrega'] = pedidos_df['Ordem de Entrega'].astype(str) + " Entrega"
+
     return pedidos_df
 
 # Função para cadastrar caminhões
@@ -180,9 +201,14 @@ def cadastrar_caminhoes():
     uploaded_caminhoes = st.file_uploader("Escolha o arquivo Excel de Caminhões", type=["xlsx", "xlsm"])
     
     if uploaded_caminhoes is not None:
+        # Salva o arquivo no database
+        file_content = uploaded_caminhoes.getvalue()
+        save_upload(DB_USERNAME, uploaded_caminhoes.name, file_content)
+        st.success("Arquivo de caminhões salvo no database com sucesso!")
+        
         novo_caminhoes_df = pd.read_excel(uploaded_caminhoes, engine='openpyxl')
         
-                # Verificar se as colunas necessárias estão presentes
+        # Verificar se as colunas necessárias estão presentes
         colunas_caminhoes = ['Placa', 'Transportador', 'Descrição Veículo', 'Capac. Cx', 'Capac. Kg', 'Disponível']
         
         if not all(col in novo_caminhoes_df.columns for col in colunas_caminhoes):
@@ -228,6 +254,11 @@ def subir_roterizacoes():
     uploaded_roterizacao = st.file_uploader("Escolha o arquivo Excel de Roteirizações", type=["xlsx", "xlsm"])
     
     if uploaded_roterizacao is not None:
+        # Salva o arquivo no database
+        file_content = uploaded_roterizacao.getvalue()
+        save_upload(DB_USERNAME, uploaded_roterizacao.name, file_content)
+        st.success("Arquivo de roteirização salvo no database com sucesso!")
+        
         novo_roterizacao_df = pd.read_excel(uploaded_roterizacao, engine='openpyxl')
         
         # Verificar se as colunas necessárias estão presentes
@@ -254,37 +285,92 @@ def subir_roterizacoes():
     st.subheader("Dados da Roteirização")
     st.dataframe(roterizacao_df)
 
+# Função para aplicar estilos Material Design
+def material_css():
+    st.markdown("""
+    <style>
+    /* Importa a fonte Roboto */
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+
+    /* Define a fonte geral */
+    html, body, [class*="css"]  {
+        font-family: 'Roboto', sans-serif;
+    }
+
+    /* Botões customizados */
+    .stButton button {
+        background-color: #6200EE; /* Roxo Material */
+        color: white;
+        border: none;
+        padding: 0.5rem 1rem;
+        border-radius: 4px;
+        transition: background-color 0.3s ease;
+    }
+    .stButton button:hover {
+        background-color: #3700B3;
+    }
+
+    /* Inputs customizados */
+    .stTextInput > div > div > input {
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 0.5rem;
+    }
+
+    /* Cabeçalho customizado */
+    .css-18e3th9 {
+        background-color: #6200EE;
+        color: white;
+        padding: 1rem;
+    }
+
+    /* Sidebar customizada */
+    .css-1d391kg {
+        background-color: #ffffff;
+        border-right: 1px solid #eee;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 # Função principal para o painel interativo
 def main():
+    material_css()  # Aplica os estilos Material Design
     st.title("Roteirizador de Pedidos")
-    
+
+    # Formulário de login
+    st.sidebar.subheader("Login no Database")
+    username_input = st.sidebar.text_input("Usuário")
+    password_input = st.sidebar.text_input("Senha", type="password")
+    login_button = st.sidebar.button("Entrar")
+
+    db_autenticado = False
+    if login_button:
+        if username_input == DB_USERNAME and password_input == DB_PASSWORD:
+            st.sidebar.success("Autenticado com sucesso!")
+            db_autenticado = True
+        else:
+            st.sidebar.error("Usuário ou senha incorretos.")
+
     # Upload do arquivo Excel de Pedidos
     uploaded_pedidos = st.file_uploader("Escolha o arquivo Excel de Pedidos", type=["xlsx", "xlsm"])
     
     if uploaded_pedidos is not None:
+        # Se estiver autenticado, salva o arquivo no DB
+        if db_autenticado:
+            file_content = uploaded_pedidos.getvalue()
+            save_upload(username_input, uploaded_pedidos.name, file_content)
+            st.success("Arquivo salvo no database com sucesso!")
+        
         # Leitura das planilhas
         pedidos_df = pd.read_excel(uploaded_pedidos, engine='openpyxl')
         
         # Formar o endereço completo
         pedidos_df['Endereço Completo'] = pedidos_df['Endereço de Entrega'] + ', ' + pedidos_df['Bairro de Entrega'] + ', ' + pedidos_df['Cidade de Entrega']
         
-        # Carregar coordenadas salvas
-        try:
-            coordenadas_salvas_df = pd.read_excel("coordenadas_salvas.xlsx", engine='openpyxl')
-            coordenadas_salvas = dict(zip(coordenadas_salvas_df['Endereço'], zip(coordenadas_salvas_df['Latitude'], coordenadas_salvas_df['Longitude'])))
-        except FileNotFoundError:
-            coordenadas_salvas = {}
-        
-        # Obter coordenadas geográficas
+        # Obter coordenadas geográficas sem precisar chamar a API se já estiver no banco
         with st.spinner('Aguarde, obtendo coordenadas de latitude e longitude...'):
-            pedidos_df['Latitude'] = pedidos_df['Endereço Completo'].apply(lambda x: obter_coordenadas_com_fallback(x, coordenadas_salvas)[0])
-            pedidos_df['Longitude'] = pedidos_df['Endereço Completo'].apply(lambda x: obter_coordenadas_com_fallback(x, coordenadas_salvas)[1])
-        
-        # Salvar coordenadas atualizadas
-        coordenadas_salvas_df = pd.DataFrame(coordenadas_salvas.items(), columns=['Endereço', 'Coordenadas'])
-        coordenadas_salvas_df[['Latitude', 'Longitude']] = pd.DataFrame(coordenadas_salvas_df['Coordenadas'].tolist(), index=coordenadas_salvas_df.index)
-        coordenadas_salvas_df.drop(columns=['Coordenadas'], inplace=True)
-        coordenadas_salvas_df.to_excel("coordenadas_salvas.xlsx", index=False)
+            pedidos_df['Latitude'] = pedidos_df['Endereço Completo'].apply(lambda x: obter_coordenadas_com_fallback(x)[0])
+            pedidos_df['Longitude'] = pedidos_df['Endereço Completo'].apply(lambda x: obter_coordenadas_com_fallback(x)[1])
         
         # Verificar se as coordenadas foram obtidas corretamente
         if pedidos_df['Latitude'].isnull().any() or pedidos_df['Longitude'].isnull().any():
@@ -322,7 +408,7 @@ def main():
         rota_tsp = st.checkbox("Aplicar TSP")
         rota_vrp = st.checkbox("Aplicar VRP")
         
-                # Mostrar opções de roteirização após o upload da planilha
+        # Mostrar opções de roteirização após o upload da planilha
         if st.button("Roteirizar"):
             # Processamento dos dados
             pedidos_df = pedidos_df[pedidos_df['Peso dos Itens'] > 0]
@@ -345,9 +431,28 @@ def main():
                 melhor_rota_vrp = resolver_vrp(pedidos_df, caminhoes_df)
                 st.write(f"Melhor rota VRP: {melhor_rota_vrp}")
             
-            # Exibir resultado
+            # Ordena os pedidos mantendo o Nº Pedido original
+            pedidos_df = pedidos_df.sort_values(by=['Nº Carga', 'Nº Pedido'])
+
+            # Cria a coluna "Ordem de Entrega" para cada grupo de "Nº Carga"
+            # A contagem reinicia para cada novo grupo (carga)
+            pedidos_df['Ordem de Entrega'] = pedidos_df.groupby('Nº Carga').cumcount() + 1
+            pedidos_df['Ordem de Entrega'] = pedidos_df['Ordem de Entrega'].astype(str) + " Entrega"
+
+            # Exibe a tabela com os dados originais e a nova coluna
             st.write("Dados dos pedidos:")
-            st.dataframe(pedidos_df[['Placa', 'Nº Carga', 'Nº Pedido', 'Cód. Cliente', 'Nome Cliente', 'Grupo Cliente', 'Endereço de Entrega', 'Bairro de Entrega', 'Cidade de Entrega', 'Qtde. dos Itens', 'Peso dos Itens']])
+            st.dataframe(pedidos_df[['Placa', 'Nº Carga', 'Nº Pedido', 'Ordem de Entrega', 
+                                     'Cód. Cliente', 'Nome Cliente', 'Grupo Cliente', 
+                                     'Endereço de Entrega', 'Bairro de Entrega', 'Cidade de Entrega', 
+                                     'Qtde. dos Itens', 'Peso dos Itens']])
+            
+            st.write("Dados dos pedidos com Ordem de Entrega e Coordenadas:")
+            st.dataframe(pedidos_df[['Nº Carga', 'Nº Pedido', 'Ordem de Entrega',
+                                     'Placa', 'Capac. Kg',
+                                     'Latitude', 'Longitude',
+                                     'Cód. Cliente', 'Nome Cliente', 'Grupo Cliente', 
+                                     'Endereço de Entrega', 'Bairro de Entrega', 'Cidade de Entrega', 
+                                     'Qtde. dos Itens', 'Peso dos Itens']])
             
             # Criar e exibir mapa
             mapa = criar_mapa(pedidos_df)
