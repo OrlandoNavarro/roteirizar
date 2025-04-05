@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import sqlite3
 import datetime
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 import networkx as nx
 from itertools import permutations
 from geopy.distance import geodesic
@@ -11,6 +11,34 @@ import folium
 from streamlit_folium import folium_static
 import random
 from db import initialize_db, save_upload, get_saved_coordinates, save_coordinates
+from ortools.constraint_solver import routing_enums_pb2
+from ortools.constraint_solver import pywrapcp
+import geopandas as gpd
+from shapely.geometry import Point
+from fastapi import FastAPI
+import numpy as np
+
+app = FastAPI()
+
+@app.get("/rota")
+def obter_rota():
+    return {"rota": ["Ponto A", "Ponto B", "Ponto C"]}
+
+@app.post("/roteirizar")
+def roteirizar(pedidos: list, caminhoes: list):
+    # Converte os dados recebidos em DataFrames
+    pedidos_df = pd.DataFrame(pedidos)
+    caminhoes_df = pd.DataFrame(caminhoes)
+
+    # Processa os dados (substitua pelas funções ajustadas)
+    pedidos_df = agrupar_por_regiao(pedidos_df)
+    dist_matrix = calcular_matriz_distancias(pedidos_df)
+    rota_tsp, distancia_tsp = resolver_tsp_ortools(dist_matrix)
+
+    return {
+        "rota_tsp": rota_tsp,
+        "distancia_tsp": distancia_tsp
+    }
 
 # Inicializa o banco de dados (caso ainda não exista)
 initialize_db()
@@ -128,10 +156,76 @@ def resolver_tsp_genetico(G):
     best_route, best_distance = genetic_algorithm(population)
     return best_route, best_distance
 
+# Resolver o TSP usando o algoritmo de aproximação
+def resolver_tsp_aproximacao():
+    G = nx.complete_graph(5)
+    for (u, v) in G.edges():
+        G.edges[u, v]['weight'] = random.randint(1, 10)
+
+    tsp_path = nx.approximation.traveling_salesman_problem(G, cycle=True)
+    print("Caminho TSP:", tsp_path)
+
+# Função para resolver o TSP usando OR-Tools
+def resolver_tsp_ortools(dist_matrix):
+    manager = pywrapcp.RoutingIndexManager(len(dist_matrix), 1, 0)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return dist_matrix[from_node][to_node]
+
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+
+    solution = routing.SolveWithParameters(search_parameters)
+    if not solution:
+        return None, None
+
+    route = []
+    index = routing.Start(0)
+    while not routing.IsEnd(index):
+        route.append(manager.IndexToNode(index))
+        index = solution.Value(routing.NextVar(index))
+    route.append(manager.IndexToNode(index))
+
+    return route, solution.ObjectiveValue()
+
 # Função para resolver o VRP usando OR-Tools
-def resolver_vrp(pedidos_df, caminhoes_df):
-    # Implementação do VRP usando OR-Tools
-    pass
+def resolver_vrp(dist_matrix, num_vehicles, depot):
+    manager = pywrapcp.RoutingIndexManager(len(dist_matrix), num_vehicles, depot)
+    routing = pywrapcp.RoutingModel(manager)
+
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return dist_matrix[from_node][to_node]
+
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+
+    solution = routing.SolveWithParameters(search_parameters)
+    if not solution:
+        return None
+
+    routes = []
+    for vehicle_id in range(num_vehicles):
+        index = routing.Start(vehicle_id)
+        route = []
+        while not routing.IsEnd(index):
+            route.append(manager.IndexToNode(index))
+            index = solution.Value(routing.NextVar(index))
+        routes.append(route)
+
+    return routes
 
 # Função para otimizar o aproveitamento da frota usando programação linear
 def otimizar_aproveitamento_frota(pedidos_df, caminhoes_df, percentual_frota, max_pedidos, n_clusters):
@@ -428,7 +522,17 @@ def main():
                 pedidos_df['Ordem de Entrega TSP'] = pedidos_df['Endereço Completo'].apply(lambda x: melhor_rota.index(x) + 1)
             
             if rota_vrp:
-                melhor_rota_vrp = resolver_vrp(pedidos_df, caminhoes_df)
+                # Calcular a matriz de distâncias
+                dist_matrix = calcular_matriz_distancias(pedidos_df)
+
+                # Número de veículos (baseado no número de caminhões disponíveis)
+                num_vehicles = len(caminhoes_df)
+
+                # Índice do depósito (endereço de partida)
+                depot = 0  # Geralmente o primeiro ponto na matriz de distâncias
+
+                # Resolver o VRP
+                melhor_rota_vrp = resolver_vrp(dist_matrix, num_vehicles, depot)
                 st.write(f"Melhor rota VRP: {melhor_rota_vrp}")
             
             # Ordena os pedidos mantendo o Nº Pedido original
@@ -471,6 +575,18 @@ def main():
                     file_name="roterizacao_resultado.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+            
+            # Criar um GeoDataFrame com coordenadas
+            data = {
+                'Endereço': pedidos_df['Endereço Completo'],
+                'Latitude': pedidos_df['Latitude'],
+                'Longitude': pedidos_df['Longitude']
+            }
+            gdf = gpd.GeoDataFrame(data, geometry=gpd.points_from_xy(data['Longitude'], data['Latitude']))
+            
+            # Salvar como arquivo GeoJSON
+            gdf.to_file("rotas.geojson", driver="GeoJSON")
+            st.write("Arquivo GeoJSON com as rotas foi salvo como 'rotas.geojson'")
     
     # Opção para cadastrar caminhões
     if st.checkbox("Cadastrar Caminhões"):
@@ -481,10 +597,28 @@ def main():
         subir_roterizacoes()
 
 # Função para agrupar pedidos por região usando KMeans
-def agrupar_por_regiao(pedidos_df, n_clusters):
+def agrupar_por_regiao_kmeans(pedidos_df, n_clusters):
     kmeans = KMeans(n_clusters=n_clusters)
     pedidos_df['Regiao'] = kmeans.fit_predict(pedidos_df[['Latitude', 'Longitude']])
     return pedidos_df
+
+# Função para agrupar pedidos por região usando DBSCAN
+def agrupar_por_regiao(pedidos_df, eps=0.01, min_samples=2):
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric='haversine')
+    # Converte latitude e longitude para radianos (necessário para DBSCAN com métrica haversine)
+    coords = pedidos_df[['Latitude', 'Longitude']].apply(lambda x: np.radians(x))
+    pedidos_df['Regiao'] = dbscan.fit_predict(coords)
+    return pedidos_df
+
+# Função para calcular a matriz de distâncias
+def calcular_matriz_distancias(pedidos_df):
+    enderecos = pedidos_df[['Latitude', 'Longitude']].values
+    n = len(enderecos)
+    dist_matrix = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            dist_matrix[i][j] = geodesic(enderecos[i], enderecos[j]).meters
+    return dist_matrix
 
 # Função para criar o mapa com as rotas
 def criar_mapa(pedidos_df):
@@ -505,6 +639,10 @@ def criar_mapa(pedidos_df):
         popup="Endereço de Partida",
         icon=folium.Icon(color='red')
     ).add_to(mapa)
+    
+    # Adicionar uma rota
+    rota = [[-23.0838, -47.1336], [-23.1, -47.2], [-23.2, -47.3]]
+    folium.PolyLine(rota, color="blue", weight=2.5, opacity=1).add_to(mapa)
     
     return mapa
 

@@ -12,3 +12,6 @@ streamlit_authenticator
 openpyxl
 geopy
 streamlit_theme
+openai
+geopandas
+fastapi uvicorn
